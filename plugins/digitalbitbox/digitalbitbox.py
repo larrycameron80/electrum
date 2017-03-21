@@ -15,6 +15,7 @@ try:
     import hid
     import json
     import math
+    import struct
     import hashlib
     from ecdsa.ecdsa import generator_secp256k1
     from ecdsa.util import sigencode_der
@@ -36,7 +37,7 @@ class DigitalBitbox_Client():
         self.password = None
         self.isInitialized = False
         self.setupRunning = False
-        self.hidBufSize = 4096
+        self.usbReportSize = 64 # firmware > v2.0.0
 
 
     def close(self):
@@ -248,13 +249,56 @@ class DigitalBitbox_Client():
         return True
 
 
+    def hid_send_frame(self, data):
+        HWW_CID = 0xFF000000
+        HWW_CMD = 0x80 + 0x40 + 0x01
+        data = bytearray(data)
+        data_len = len(data)
+        seq = 0;
+        idx = 0;
+        write = []
+        while idx < data_len:
+            if idx == 0:
+                # INIT frame
+                write = data[idx : idx + min(data_len, self.usbReportSize - 7)]
+                self.dbb_hid.write('\0' + struct.pack(">IBH", HWW_CID, HWW_CMD, data_len & 0xFFFF) + write + '\xEE' * (self.usbReportSize - 7 - len(write)))
+            else: 
+                # CONT frame
+                write = data[idx : idx + min(data_len, self.usbReportSize - 5)]
+                self.dbb_hid.write('\0' + struct.pack(">IB", HWW_CID, seq) + write + '\xEE' * (self.usbReportSize - 5 - len(write)))
+                seq += 1
+            idx += len(write)
+
+
+    def hid_read_frame(self):
+        # INIT response
+        read = self.dbb_hid.read(self.usbReportSize)
+        cid = ((read[0] * 256 + read[1]) * 256 + read[2]) * 256 + read[3]
+        cmd = read[4]
+        data_len = read[5] * 256 + read[6]
+        data = read[7:]
+        idx = len(read) - 7;
+        while idx < data_len:
+            # CONT response
+            read = self.dbb_hid.read(self.usbReportSize)
+            data += read[5:]
+            idx += len(read) - 5
+        return data
+
+
     def hid_send_plain(self, msg):
         reply = ""
         try:
-            self.dbb_hid.write('\0' + bytearray(msg) + '\0' * (self.hidBufSize - len(msg)))
-            r = []
-            while len(r) < self.hidBufSize:
-                r = r + self.dbb_hid.read(self.hidBufSize)
+            serial_number = self.dbb_hid.get_serial_number_string()
+            if "v2.0." in serial_number or "v1." in serial_number:
+                hidBufSize = 4096
+                self.dbb_hid.write('\0' + bytearray(msg) + '\0' * (hidBufSize - len(msg)))
+                r = []
+                while len(r) < hidBufSize:
+                    r = r + self.dbb_hid.read(hidBufSize)
+            else:
+                self.hid_send_frame(msg)
+                r = self.hid_read_frame()
             r = str(bytearray(r)).rstrip(' \t\r\n\0')
             r = r.replace("\0", '')
             reply = json.loads(r)
@@ -493,11 +537,14 @@ class DigitalBitboxPlugin(HW_PluginBase):
 
 
     def create_client(self, device, handler):
-        self.handler = handler
-        client = self.get_dbb_device(device)
-        if client <> None:
-            client = DigitalBitbox_Client(client)
-        return client
+        if device.interface_number == 0 or device.usage_page == 0xffff:
+            self.handler = handler
+            client = self.get_dbb_device(device)
+            if client <> None:
+                client = DigitalBitbox_Client(client)
+            return client
+        else:
+            return None
 
 
     def setup_device(self, device_info, wizard):        
